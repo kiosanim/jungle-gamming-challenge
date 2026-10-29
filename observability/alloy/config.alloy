@@ -1,0 +1,69 @@
+// Coleta os logs das réplicas da aplicação (api, consumer e workers) pelo
+// socket do Docker e envia para o Loki. A aplicação continua só escrevendo
+// JSON no stdout; nada nela sabe que o Loki existe.
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+}
+
+// Só os papéis da aplicação. Cada linha ganha os labels `service` (o papel)
+// e `container` (a réplica), que são poucos e estáveis.
+discovery.relabel "wagering" {
+  targets = discovery.docker.containers.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    regex         = "api|consumer|workers"
+    action        = "keep"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+loki.source.docker "wagering" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.wagering.output
+  labels           = { app = "wagering" }
+  forward_to       = [loki.process.json.receiver]
+  refresh_interval = "5s"
+}
+
+// O nível do log vira label, para filtrar rápido. traceId e correlationId
+// variam a cada requisição, então vão como metadado estruturado: dá para
+// filtrar por eles sem explodir a quantidade de streams no Loki.
+loki.process "json" {
+  stage.json {
+    expressions = {
+      level         = "level",
+      traceId       = "traceId",
+      correlationId = "correlationId",
+    }
+  }
+
+  stage.labels {
+    values = { level = "" }
+  }
+
+  stage.structured_metadata {
+    values = {
+      traceId       = "",
+      correlationId = "",
+    }
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

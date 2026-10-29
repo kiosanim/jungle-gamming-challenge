@@ -1,0 +1,32 @@
+# Coleta o `/metrics` de cada réplica dos três papéis. As réplicas são
+# descobertas pelo DNS interno do Compose (o nome do serviço resolve para
+# todas as réplicas), então `--scale` entra na coleta sem mudar este arquivo.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: api
+    dns_sd_configs:
+      - names: [api]
+        type: A
+        port: 3000
+        refresh_interval: 10s
+
+  - job_name: consumer
+    dns_sd_configs:
+      - names: [consumer]
+        type: A
+        port: 3000
+        refresh_interval: 10s
+
+  - job_name: workers
+    dns_sd_configs:
+      - names: [workers]
+        type: A
+        port: 3000
+        refresh_interval: 10s
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

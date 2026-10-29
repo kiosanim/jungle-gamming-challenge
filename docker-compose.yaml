@@ -1,0 +1,275 @@
+# Configuração comum aos papéis da aplicação (api, consumer, workers).
+x-role-env: &role-env
+  PORT: ${PORT}
+  DATABASE_HOST: postgres
+  DATABASE_PORT: ${DATABASE_PORT}
+  SQS_ENDPOINT_URL: http://localstack-aws:4566
+  WORKERS_ENABLED: "true"
+  # Traces OTLP/HTTP para o Jaeger (o nome do serviço vai em cada papel).
+  OTEL_ENABLED: "true"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4318
+
+x-role: &role
+  env_file:
+    - ./.env
+  environment:
+    <<: *role-env
+  stop_grace_period: 40s
+  depends_on:
+    setup:
+      condition: service_completed_successfully
+    jaeger:
+      condition: service_started
+  healthcheck:
+    test:
+      [
+        "CMD",
+        "bun",
+        "-e",
+        "const r = await fetch('http://localhost:3000/health/ready'); process.exit(r.ok ? 0 : 1)",
+      ]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  postgres:
+    image: postgres:16.15-alpine3.24
+    restart: no
+    environment:
+      POSTGRES_USER: ${DATABASE_USER}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD}
+      POSTGRES_DB: ${DATABASE_NAME}
+    ports:
+      - ${DATABASE_PORT}:5432
+    env_file:
+      - ./.env
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  localstack-aws:
+    container_name: "${LOCALSTACK_DOCKER_NAME:-localstack-aws-main}"
+    # Community fixada em 4.10: roda sem token e inclui SQS. Não usar `latest`,
+    # que passou a exigir licença (LOCALSTACK_AUTH_TOKEN).
+    image: localstack/localstack:4.10
+    ports:
+      - "127.0.0.1:4566:4566"
+      - "127.0.0.1:4510-4559:4510-4559"
+    environment:
+      - DEBUG=1
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:4566/_localstack/health')",
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  # Identity Provider: tokens OAuth2 client credentials para provedores e
+  # backoffice. Realm importado de keycloak/realm-wagering.json (credenciais
+  # de desenvolvimento). Heap limitado para caber numa VM Docker pequena.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.0
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Emissor fixo: tokens obtidos por localhost ou pela rede interna têm o mesmo `iss`.
+      KC_HOSTNAME: http://localhost:8080
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+      KC_HEALTH_ENABLED: "true"
+      JAVA_OPTS_KC_HEAP: "-Xms64m -Xmx384m"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/realm-wagering.json:/opt/keycloak/data/import/realm-wagering.json:ro
+    healthcheck:
+      # a imagem não tem curl: requisição HTTP crua na porta de gerenciamento
+      test:
+        [
+          "CMD-SHELL",
+          "exec 3<>/dev/tcp/localhost/9000 && printf 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q UP <&3",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
+  # Execução única: migrations (CLI do MikroORM) e filas SQS. Separado das
+  # réplicas da aplicação para que não migrem o banco em paralelo.
+  setup:
+    build:
+      context: .
+      target: setup
+    image: wagering-setup:local
+    env_file:
+      - ./.env
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: ${DATABASE_PORT}
+      SQS_ENDPOINT_URL: http://localstack-aws:4566
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack-aws:
+        condition: service_healthy
+    restart: "no"
+
+  # API HTTP: três réplicas concorrentes atrás das portas 3000–3002.
+  api:
+    <<: *role
+    build:
+      context: .
+      target: api
+    image: wagering-api:local
+    deploy:
+      replicas: 3
+    ports:
+      - "3000-3002:3000"
+    environment:
+      <<: *role-env
+      OTEL_SERVICE_NAME: wagering-api
+      AUTH_ENABLED: "true"
+      # `iss` dos tokens é sempre localhost:8080 (KC_HOSTNAME); as chaves são
+      # buscadas pela rede interna do Compose.
+      AUTH_ISSUER: http://localhost:8080/realms/wagering
+      AUTH_JWKS_URL: http://keycloak:8080/realms/wagering/protocol/openid-connect/certs
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_healthy
+      jaeger:
+        condition: service_started
+
+  # Consumidores da fila FIFO de transações (HTTP só para health e métricas).
+  consumer:
+    <<: *role
+    build:
+      context: .
+      target: consumer
+    image: wagering-consumer:local
+    environment:
+      <<: *role-env
+      OTEL_SERVICE_NAME: wagering-consumer
+    deploy:
+      replicas: 2
+
+  # Publisher da outbox e referências pendentes (HTTP só para health e métricas).
+  workers:
+    <<: *role
+    build:
+      context: .
+      target: workers
+    image: wagering-workers:local
+    environment:
+      <<: *role-env
+      OTEL_SERVICE_NAME: wagering-workers
+    deploy:
+      replicas: 2
+
+  # Traces distribuídos (OpenTelemetry): recebe OTLP/HTTP das réplicas na
+  # 4318 e serve a interface na 16686. Armazenamento em memória (dev).
+  jaeger:
+    image: jaegertracing/jaeger:2.11.0
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+
+  # Logs centralizados. Recebe do Alloy as linhas JSON das réplicas e guarda
+  # por 7 dias em disco local (observability/loki/loki.yml).
+  loki:
+    image: grafana/loki:3.5.5
+    command: ["-config.file=/etc/loki/loki.yml"]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./observability/loki/loki.yml:/etc/loki/loki.yml:ro
+      - loki_data:/loki
+
+  # Coletor de logs: lê o stdout das réplicas de api, consumer e workers pelo
+  # socket do Docker e envia para o Loki (observability/alloy/config.alloy).
+  alloy:
+    image: grafana/alloy:v1.10.2
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "12345:12345"
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      loki:
+        condition: service_started
+
+  # Coleta as métricas das réplicas de api, consumer e workers (descoberta por
+  # DNS do Compose; ver observability/prometheus/prometheus.yml).
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Um só lugar para métricas (Prometheus), logs (Loki) e traces (Jaeger),
+  # com links entre eles. Datasources e dashboard são provisionados a partir
+  # de observability/grafana (versionados, não editáveis pela UI).
+  grafana:
+    image: grafana/grafana:12.1.0
+    ports:
+      - "3030:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Leitura sem login em desenvolvimento; editar exige o admin.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/wagering-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_started
+      jaeger:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pg_data:
+  prometheus_data:
+  grafana_data:
+  loki_data:

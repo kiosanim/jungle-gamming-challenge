@@ -1,0 +1,50 @@
+# Datasources provisionados na subida do Grafana, com uids fixos e ligados
+# entre si: do log se chega ao trace pelo traceId, e do trace se chega aos
+# logs da mesma requisição. Variáveis do Grafana aparecem como $${...} porque
+# o provisionamento expande $VAR do ambiente.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      timeInterval: 5s
+
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      # Cada linha com traceId vira um link para o trace no Jaeger.
+      derivedFields:
+        - name: TraceID
+          matcherType: regex
+          matcherRegex: '"traceId":"(\w+)"'
+          url: "$${__value.raw}"
+          datasourceUid: jaeger
+          urlDisplayLabel: Abrir trace no Jaeger
+
+  - name: Jaeger
+    uid: jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false
+    jsonData:
+      # Em cada span, um botão leva aos logs do mesmo trace no Loki.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-5m"
+        spanEndTimeShift: "5m"
+        filterByTraceID: false
+        filterBySpanID: false
+        customQuery: true
+        query: '{app="wagering"} |= "$${__trace.traceId}"'
